@@ -1,0 +1,7 @@
+tunnel: face-auth
+credentials-file: /home/stem/.cloudflared/<トンネルID>.json
+
+ingress:
+  - hostname: face-auth.あなたのドメイン.com
+    service: http://localhost:8000
+  - service: http_status:404
