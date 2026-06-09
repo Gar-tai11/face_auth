@@ -5,31 +5,50 @@ import numpy as np
 import cv2
 import face_recognition
 from dotenv import load_dotenv
-from supabase import create_client
+from supabase import create_client, ClientOptions
 
+# ============================================================
+# 設定
+# ============================================================
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-SUPABASE_URL         = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY    = os.getenv("SUPABASE_ANON_KEY")
-RECOGNITION_THRESHOLD = 0.45
-COOLDOWN_SECONDS      = 5
-SCALE_FACTOR          = 0.25
-ALPHA                 = 0.05
+SUPABASE_URL              = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+RECOGNITION_THRESHOLD     = 0.45
+COOLDOWN_SECONDS          = 5
+SCALE_FACTOR              = 0.25
+ALPHA                     = 0.05  # 移動平均の更新率
 
-supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY,
+    options=ClientOptions(schema="attendance")
+)
 
+# ============================================================
+# メモリ構造
+# {user_id: {"card_id": str, "encodings": [...], "enc_ids": [...]}}
+# ============================================================
 user_data: dict[str, dict] = {}
 
+# ============================================================
+# 起動時にSupabaseからベクトル＋card_idを取得
+# ============================================================
 def load_from_supabase():
     print("[起動] Supabaseからデータを読み込み中...")
 
-    users_res = supabase.table("users").select("supabase_auth_user_id, card_id").execute()
+    users_res = supabase.table("users").select(
+        "supabase_auth_user_id, card_id"
+    ).execute()
+
     card_id_map = {
         row["supabase_auth_user_id"]: row["card_id"]
         for row in users_res.data
     }
 
-    enc_res = supabase.table("face_encodings").select("user_id, id, encoding").execute()
+    enc_res = supabase.table("face_encodings").select(
+        "id, user_id, encoding"
+    ).execute()
 
     for row in enc_res.data:
         uid = row["user_id"]
@@ -39,7 +58,7 @@ def load_from_supabase():
             user_data[uid] = {
                 "card_id":   card_id_map.get(uid, ""),
                 "encodings": [],
-                "enc_ids":   [] 
+                "enc_ids":   []
             }
         user_data[uid]["encodings"].append(enc)
         user_data[uid]["enc_ids"].append(row["id"])
@@ -47,6 +66,9 @@ def load_from_supabase():
     total = sum(len(v["encodings"]) for v in user_data.values())
     print(f"[起動] {len(user_data)}人 / {total}件のベクトルを読み込みました")
 
+# ============================================================
+# 移動平均でベクトルを更新してSupabaseに書き戻す
+# ============================================================
 def update_encoding(user_id: str, enc_index: int, new_encoding: np.ndarray):
     stored  = user_data[user_id]["encodings"][enc_index]
     updated = (1 - ALPHA) * stored + ALPHA * new_encoding
@@ -58,15 +80,21 @@ def update_encoding(user_id: str, enc_index: int, new_encoding: np.ndarray):
         "is_adaptive": True
     }).eq("id", enc_id).execute()
 
+# ============================================================
+# キーボード入力
+# ============================================================
 def type_text(text: str):
     subprocess.run(["wtype", text])
     print(f"[入力] {text}")
 
+# ============================================================
+# メインループ
+# ============================================================
 def main():
     load_from_supabase()
 
     if not user_data:
-        print("[エラー] 登録されたユーザーがいません。先に顔登録APIを呼び出してください。")
+        print("[エラー] 登録されたユーザーがいません。register.pyで先に登録してください。")
         return
 
     cap = cv2.VideoCapture(0)
@@ -75,7 +103,6 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     last_input_time = {}
-
     print("カメラ映像を開始します。qキーで終了。")
 
     while True:
@@ -91,17 +118,16 @@ def main():
         face_encs      = face_recognition.face_encodings(rgb_small, face_locations)
 
         for face_enc, face_loc in zip(face_encs, face_locations):
-
-            best_uid   = None
-            best_idx   = None
-            best_dist  = float("inf")
+            best_uid  = None
+            best_idx  = None
+            best_dist = float("inf")
 
             for uid, data in user_data.items():
                 if not data["encodings"]:
                     continue
                 dists    = face_recognition.face_distance(data["encodings"], face_enc)
                 min_idx  = int(np.argmin(dists))
-                min_dist = dists[min_idx]
+                min_dist = float(dists[min_idx])
                 if min_dist < best_dist:
                     best_dist = min_dist
                     best_uid  = uid
@@ -115,7 +141,7 @@ def main():
                 now     = time.time()
 
                 if now - last_input_time.get(best_uid, 0) > COOLDOWN_SECONDS:
-                    print(f"[認証成功] user_id={best_uid} card_id={card_id} (距離: {best_dist:.3f})")
+                    print(f"[認証成功] card_id={card_id} (距離: {best_dist:.3f})")
                     type_text(card_id)
                     last_input_time[best_uid] = now
                     update_encoding(best_uid, best_idx, face_enc)
